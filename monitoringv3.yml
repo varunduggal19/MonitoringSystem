@@ -1,0 +1,540 @@
+Resources:
+  MyDynamoDBTable:
+    Type: 'AWS::DynamoDB::Table'
+    Properties:
+      AttributeDefinitions:
+        - AttributeName: 'Server_Name'
+          AttributeType: 'S'
+      KeySchema:
+        - AttributeName: 'Server_Name'
+          KeyType: 'HASH'
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5
+      TableName: 'Server_Status'
+
+  RestApiGateway:
+    Type: 'AWS::ApiGateway::RestApi'
+    Properties:
+      Name: 'RestApiGateway'
+      Description: 'ApiGateway'
+
+  DevRestApiKey:
+    Type: 'AWS::ApiGateway::ApiKey'
+    Properties:
+      Name: 'DevRestApiKey'
+      Description: 'My API Key'
+      Enabled: true
+      Value: '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ'
+      StageKeys:
+        - RestApiId: !Ref RestApiGateway
+          StageName: 'dev'
+    DependsOn:
+      - DevStage
+      - RestApiGateway
+
+  DevUsagePlan:
+    Type: 'AWS::ApiGateway::UsagePlan'
+    Properties:
+      UsagePlanName: 'DevUsagePlan'
+      Description: 'My Usage Plan'
+      ApiStages:
+        - ApiId: !Ref RestApiGateway
+          Stage: dev
+      Quota:
+        Limit: 50000
+        Period: 'MONTH'
+      Throttle:
+        BurstLimit: 10
+        RateLimit: 10
+    DependsOn:
+      - RestApiGateway
+      - DevStage
+  ServerSummarizedStatusGetLambda:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+
+          def lambda_handler(event, context):
+              # Create a DynamoDB client
+              dynamodb = boto3.client('dynamodb')
+
+              # Query DynamoDB table to check server status, filtering for inactive statuses
+              response = dynamodb.scan(
+                  TableName='Server_Status',
+                  ProjectionExpression='Server_Status',
+                  FilterExpression='Server_Status = :inactive',
+                  ExpressionAttributeValues={
+                      ':inactive': {'S': 'inactive' }
+                  }
+              )
+
+              # Check if any server is inactive
+              if 'Items' in response and response['Items']:
+                  # Return trouble response
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'trouble'
+                      })
+                  }
+
+              # Return available response
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps({
+                      'message': 'available'
+                  })
+              }
+
+
+      Handler: 'index.lambda_handler'
+      Runtime: 'python3.9'
+      MemorySize: 128
+      Timeout: 10
+      Role: !GetAtt LambdaFunctionIamRole.Arn
+
+  ServerListGetLambda:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+
+          dynamodb = boto3.resource('dynamodb')
+          table = dynamodb.Table('Server_Status')
+
+          def lambda_handler(event, context):
+              response = table.scan(
+                  ProjectionExpression='Server_Name, Server_IP, Server_Score, Server_Status, Server_Timestamp'
+              )
+
+              servers = response['Items']
+              servers.sort(key=lambda x: x['Server_Score'], reverse=True)
+
+              server_list = []
+              for server in servers:
+                  server_name = server['Server_Name']
+                  server_ip = server['Server_IP']
+                  server_score = server['Server_Score']
+                  server_status = server['Server_Status']
+                  server_timestamp = server['Server_Timestamp']
+                  server_data = {
+                      'server_name': server_name,
+                      'server_ip': server_ip,
+                      'server_score': server_score,
+                      'server_status': server_status,
+                  }
+                  server_list.append(server_data)
+
+              response = {
+                  'statusCode': 200,
+                  'headers': {
+                      'Content-Type': 'application/json',
+                      'Access-Control-Allow-Origin': '*',
+                      'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token',
+                      'Access-Control-Allow-Methods': 'GET'
+                  },
+                  'body': json.dumps(server_list)
+              }
+
+              return response
+
+      Handler: 'index.lambda_handler'
+      Runtime: 'python3.8'
+      Timeout: 3
+      Role: !GetAtt LambdaFunctionIamRole.Arn
+
+  ServerStatusUpdateLambda:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+
+          def lambda_handler(event, context):
+              
+              # Retrieve the POST request body and parse it as JSON
+              request_body = json.loads(event['body'])
+              
+              # Retrieve the values from the POST request body
+              server_name = request_body['server_name']
+              server_ip = request_body['server_ip']
+              server_score = request_body['server_score']
+              server_status = request_body['server_status']
+              
+              # Create a DynamoDB client
+              dynamodb = boto3.client('dynamodb')
+              
+              # Define the DynamoDB table name
+              table_name = 'Server_Status'
+              
+              item = {
+                  'Server_IP': {'Value': {'S': server_ip}, 'Action': 'PUT'},
+                  'Server_Score': {'Value': {'S': server_score}, 'Action': 'PUT'},
+                  'Server_Status': {'Value': {'S': server_status}, 'Action': 'PUT'},
+                  'Server_Timestamp': {'Value':{'N': str(context.get_remaining_time_in_millis())}, 'Action': 'PUT'}
+              }    
+
+              
+              # Update the item in DynamoDB
+              dynamodb.update_item(TableName=table_name, Key={'Server_Name': {'S': server_name}}, AttributeUpdates=item)
+              
+              # Return a successful response
+              response = {
+                  'statusCode': 200,
+                  'body': json.dumps('Record added to DynamoDB table')
+              }
+              return response
+
+      Handler: 'index.lambda_handler'
+      Runtime: 'python3.9'
+      MemorySize: 128
+      Timeout: 10
+      Role: !GetAtt LambdaFunctionIamRole.Arn      
+  StatusApiGatewayResource:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      ParentId: !GetAtt RestApiGateway.RootResourceId
+      RestApiId: !Ref RestApiGateway
+      PathPart: 'status'
+  ServerStatusUpdateApiPostMethod:
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      HttpMethod: 'POST'
+      ResourceId: !Ref ServerApiGatewayResource
+      RestApiId: !Ref RestApiGateway
+      RequestValidatorId: !Ref ServerStatusUpdateBodyValidator
+      RequestModels:
+        application/json: !Ref PostServerModel
+      AuthorizationType: 'NONE'
+      ApiKeyRequired: true
+      Integration:
+        Type: 'AWS_PROXY'
+        IntegrationHttpMethod: 'POST'
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ServerStatusUpdateLambda.Arn}/invocations'
+  MyDeployment:
+    Type: 'AWS::ApiGateway::Deployment'
+    DependsOn:
+      - ServerStatusUpdateApiPostMethod
+    Properties:
+      RestApiId: !Ref RestApiGateway
+  DevStage:
+    Type: 'AWS::ApiGateway::Stage'
+    Properties:
+      DeploymentId: !Ref MyDeployment
+      RestApiId: !Ref RestApiGateway
+      StageName: 'dev'
+
+  ServerScheduledCheckLambdaFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Code:
+        ZipFile: |
+          import boto3
+          from botocore.exceptions import ClientError
+          import os
+
+          sns_client = boto3.client('sns')
+          dynamodb_client = boto3.client('dynamodb')
+          sns_topic_arn = os.environ['SNS_TOPIC_ARN']
+          last_inactive_servers = []
+
+          def lambda_handler(event, context):
+              # Get current server status from DynamoDB table
+              try:
+                  response = dynamodb_client.scan(
+                      TableName='Server_Status',
+                      FilterExpression='Server_Status = :inactive OR Server_Alerted = :true',
+                      ExpressionAttributeValues={
+                          ':inactive': {'S': 'inactive'},
+                          ':true':  {'BOOL': True}
+                      }
+                  )
+                  items = response['Items']
+                  prev_alert_count=0
+                  for item in items:
+                      if item['Server_Status']['S'] == 'inactive' and item.get('Server_Alerted', {'BOOL': False})['BOOL']:
+                          prev_alert_count +=1
+
+
+                  print('Items found ' + str(len(items)))
+                  for item in items:
+                      print('Processing....')
+                      print(item['Server_Status'])
+                      print(item['Server_Name'])
+                      print(item.get('Server_Alerted',{'BOOL': False}))
+                      if item['Server_Status']['S'] == 'inactive' and not item.get('Server_Alerted',{'BOOL': False})['BOOL']:
+                          if prev_alert_count == 0: 
+                              # Send email alert
+                              message = 'Server {} is inactive'.format(item['Server_Name']['S'])
+                              print('Sending message ' + message)
+                              sns_client.publish(
+                                  TopicArn=sns_topic_arn,
+                                  Message=message,
+                                  Subject='Server Status Alert'
+                              )
+                          if prev_alert_count ==2 : 
+                              # Send email alert
+                              print('Sending message ' + message)
+                              message = 'Server {} is inactive'.format(item['Server_Name']['S'])
+                              sns_client.publish(
+                                  TopicArn=sns_topic_arn,
+                                  Message=message,
+                                  Subject='Server Status Alert'
+                              )
+
+                          # Update Server_Alerted to True
+                          dynamodb_client.update_item(
+                              TableName='Server_Status',
+                              Key={'Server_Name': item['Server_Name']},
+                              UpdateExpression='SET Server_Alerted = :true',
+                              ExpressionAttributeValues={':true': {'BOOL': True}}
+                          )
+
+
+                          prev_alert_count +=1
+                          
+                      elif item['Server_Status']['S'] == 'active' and item.get('Server_Alerted', {'BOOL': False})['BOOL']:
+                          # Send email alert that the server is back to active
+                          message = 'Server {} is back to active'.format(item['Server_Name'])
+                          print('Sending message ' + message)
+                          sns_client.publish(
+                              TopicArn=sns_topic_arn,
+                              Message=message,
+                              Subject='Server Status Alert'
+                          )
+                          # Update Server_Alerted to False
+                          dynamodb_client.update_item(
+                              TableName='Server_Status',
+                              Key={'Server_Name':  item['Server_Name']},
+                              UpdateExpression='SET Server_Alerted = :false',
+                              ExpressionAttributeValues={':false' : {'BOOL': False}}
+                          )
+              except ClientError as e:
+                  print('Error in lambda processing')
+                  print(e.response['Error']['Message'])
+
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref ServerStatusChangeTopic
+      Handler: 'index.lambda_handler'
+      Runtime: 'python3.9'
+      MemorySize: 128
+      Timeout: 30
+      Role: !GetAtt LambdaFunctionIamRole.Arn          
+
+  ServerStatusChangeTopic:
+    Type: 'AWS::SNS::Topic'
+    Properties:
+      DisplayName: 'Server Status Alerts'
+      TopicName: 'server-status-alerts'
+  EmailStatusAlertSubscription:
+    Type: 'AWS::SNS::Subscription'
+    Properties:
+      Protocol: 'email'
+      TopicArn: !Ref ServerStatusChangeTopic
+      Endpoint: 'varundu@gmail.com'
+
+  ScheduledCheckStatusRule:
+    Type: 'AWS::Events::Rule'
+    Properties:
+      Name: 'ScheduledCheckStatusRule'
+      Description: 'My scheduled rule'
+      ScheduleExpression: 'rate(5 minutes)'
+      Targets:
+        - Arn: !GetAtt ServerScheduledCheckLambdaFunction.Arn
+          Id: 'ServerScheduledLambdaFunctionTarget'
+
+  ScheduledLambdaPermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      FunctionName: !GetAtt ServerScheduledCheckLambdaFunction.Arn
+      Action: 'lambda:InvokeFunction'
+      Principal: 'events.amazonaws.com'
+      SourceArn: !GetAtt ScheduledCheckStatusRule.Arn
+
+  ServerStatusGetLambdaPermission:
+   Type: "AWS::Lambda::Permission"
+   Properties:
+    Action: "lambda:InvokeFunction"
+    FunctionName: !GetAtt ServerSummarizedStatusGetLambda.Arn
+    Principal: "apigateway.amazonaws.com"
+  ServerListGetLambdaPermission:
+   Type: "AWS::Lambda::Permission"
+   Properties:
+    Action: "lambda:InvokeFunction"
+    FunctionName: !GetAtt ServerListGetLambda.Arn
+    Principal: "apigateway.amazonaws.com"
+  ServerPostLambdaPermission:
+   Type: "AWS::Lambda::Permission"
+   Properties:
+    Action: "lambda:InvokeFunction"
+    FunctionName: !GetAtt ServerStatusUpdateLambda.Arn
+    Principal: "apigateway.amazonaws.com"
+
+
+  ServerApiGatewayResource:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      RestApiId: !Ref RestApiGateway
+      ParentId: !GetAtt RestApiGateway.RootResourceId
+      PathPart: 'servers'
+
+  ServerSummarizedStatusGetRestApiMethod:
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      RestApiId: !Ref RestApiGateway
+      ResourceId: !Ref StatusApiGatewayResource
+      HttpMethod: 'GET'
+      AuthorizationType: 'NONE'
+      ApiKeyRequired: false
+      Integration:
+        Type: 'AWS_PROXY'
+        IntegrationHttpMethod: 'POST'
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ServerSummarizedStatusGetLambda.Arn}/invocations'
+
+  ServerListGetRestApiMethod:
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      RestApiId: !Ref RestApiGateway
+      ResourceId: !Ref ServerApiGatewayResource
+      HttpMethod: 'GET'
+      AuthorizationType: 'NONE'
+      ApiKeyRequired: true      
+      Integration:
+        Type: 'AWS_PROXY'
+        IntegrationHttpMethod: 'POST'
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ServerListGetLambda.Arn}/invocations'
+
+  ApiGatewayIamRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: ''
+            Effect: 'Allow'
+            Principal:
+              Service:
+                - 'apigateway.amazonaws.com'
+            Action:
+              - 'sts:AssumeRole'
+      Path: '/'
+      Policies:
+        - PolicyName: LambdaAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: 'Allow'
+                Action: 'lambda:InvokeFunction'
+                Resource: '*'
+
+  LambdaFunctionIamRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: 'lambda.amazonaws.com'
+            Action: 'sts:AssumeRole'
+      Path: '/'
+      Policies:
+        - PolicyName: 'dynamodb-access'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'dynamodb:GetItem'
+                  - 'dynamodb:PutItem'
+                  - 'dynamodb:UpdateItem'
+                  - 'dynamodb:Scan'
+                Resource: !GetAtt MyDynamoDBTable.Arn
+        - PolicyName: 'sns-access'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'sns:Publish'
+                Resource: !Ref ServerStatusChangeTopic
+  ServerStatusUpdateBodyValidator:
+    Type: AWS::ApiGateway::RequestValidator
+    Properties:
+      RestApiId: !Ref RestApiGateway
+      Name: ServerStatusUpdateBodyValidator
+      ValidateRequestBody: true
+  PostServerModel:
+    Type: 'AWS::ApiGateway::Model'
+    Properties:
+      RestApiId: !Ref RestApiGateway
+      ContentType: application/json
+      Description: Schema for Post model on Server
+      Name: PostServerModel
+      Schema:
+        $schema: 'http://json-schema.org/draft-04/schema#'
+        title: PostServerModel
+        type: object
+        required:
+          - server_name
+          - server_ip
+          - server_score
+          - server_status
+        properties:
+          server_name:
+            type: string
+          server_ip:
+            type: string
+          server_score:
+            type: string
+          server_status:
+            type: string
+            enum:
+              - active
+              - inactive
+
+Outputs:
+  RestApiStatusUrl:
+    Description: 'API Gateway endpoint URL'
+    Value: !Sub 'https://${RestApiGateway}.execute-api.${AWS::Region}.amazonaws.com/status'
+    Export:
+      Name: !Sub '${AWS::StackName}-api-gateway-url'
+  MyLambdaFunctionARN:
+    Description: 'ARN of the lambda function'
+    Value: !GetAtt ServerSummarizedStatusGetLambda.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-lambda-function-arn'
+  MyLambdaFunctionName:
+    Description: 'Name of the lambda function'
+    Value: !Ref ServerSummarizedStatusGetLambda
+    Export:
+      Name: !Sub '${AWS::StackName}-lambda-function-name'
+  MyLambdaFunctionGETARN:
+    Description: 'ARN of the lambda function for GET method'
+    Value: !GetAtt ServerListGetLambda.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-lambda-function-get-arn'
+  ServerListGetLambdaName:
+    Description: 'Name of the lambda function for GET method'
+    Value: !Ref ServerListGetLambda
+    Export:
+      Name: !Sub '${AWS::StackName}-lambda-function-get-name'
+  MySNSTopicARN:
+    Description: 'ARN of the SNS topic'
+    Value: !Ref ServerStatusChangeTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-sns-topic-arn'
+  ServersApiEndpoint:
+    Description: 'Dev Stage API Endpoint for Servers API'
+    Value: !Sub 'https://${RestApiGateway}.execute-api.${AWS::Region}.amazonaws.com/servers'
+  ApiKey:
+    Description: 'API Key'
+    Value: !Ref DevRestApiKey     
